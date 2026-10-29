@@ -291,9 +291,14 @@ def check_range(status, content_range, start, end):
         raise IOError("range request answered with Content-Range %r, not %s..." % (content_range, want))
 
 
+_PINNED_GONE = False                        # resolve_repo: the pinned revision is gone and main is read in its place
+
+
 def pinned():
-    """The tensors' hashes are the pinned revision's: they apply when this run reads that revision."""
-    return REPO == PINNED
+    """The tensors' hashes are the pinned revision's: they apply when this run reads that revision, and also when
+    STRATA_ALLOW_UNPINNED=1 reads main in its place (the tensors must still be the pinned ones; only the revision that
+    serves them changed).  An explicit STRATA_MTP_REVISION is another checkpoint: no hashes apply to it."""
+    return REPO == PINNED or (_PINNED_GONE and REVISION == PINNED_REVISION)
 
 
 def sha256_of(path):
@@ -307,7 +312,7 @@ def sha256_of(path):
 def resolve_repo():
     """REPO.  When the pinned revision is gone from the repository (a 404 on its index) it stops, unless
     STRATA_ALLOW_UNPINNED=1: then the current files are read (their tensors are still checked against the pinned SHA256)."""
-    global REPO
+    global REPO, _PINNED_GONE
     try:
         req = urllib.request.Request(REPO + "model.safetensors.index.json", method="HEAD",
                                      headers={"User-Agent": "strata-mtp-fetch"})
@@ -319,6 +324,7 @@ def resolve_repo():
             print("STRATA_ALLOW_UNPINNED=1: the checkpoint's pinned revision %s is gone: reading its current files "
                   "(main); every tensor is still checked against the pinned SHA256" % REVISION, file=sys.stderr)
             REPO = REPO.replace("/resolve/%s/" % REVISION, "/resolve/main/")
+            _PINNED_GONE = True
     except OSError:
         pass                                        # no answer: get() retries and reports it
     return REPO

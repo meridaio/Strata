@@ -139,7 +139,10 @@ def allow_unpinned() -> bool:
 
 
 def file_pin(url: str):
-    """(bytes, sha256) pinned for the Hugging Face file `url` names (REPO_PINS), else None."""
+    """(bytes, sha256) pinned for `url`: a source archive or tool setup fetches (SOURCE_PINS), or the Hugging Face file it
+    names (REPO_PINS); else None."""
+    if url in SOURCE_PINS:
+        return SOURCE_PINS[url]
     m = HF_FILE.match(url)
     if m is None:
         return None
@@ -221,6 +224,25 @@ def ms_meta(repo: str, path: str):
 HF = hf("ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF")
 LLAMA_CPP_COMMIT = "3cf03257f219afbe7334045ff7c6a06ac68c627d"
 LLAMA_CPP_ZIP = f"https://github.com/ggml-org/llama.cpp/archive/{LLAMA_CPP_COMMIT}.zip"
+# NVIDIA's CUDA apt repository key package (install_build_tools, then `sudo dpkg -i`): (bytes, sha256) per repo and arch
+CUDA_KEYRING_URL = "https://developer.download.nvidia.com/compute/cuda/repos/{repo}/{arch}/cuda-keyring_1.1-1_all.deb"
+CUDA_KEYRING_PINS = {
+    ("ubuntu2204", "x86_64"): (4332, "d93190d50b98ad4699ff40f4f7af50f16a76dac3bb8da1eaaf366d47898ff8df"),
+    ("ubuntu2204", "sbsa"): (4320, "36d1aed84dfcf93ee9a0212d149f1c4187db92e03ab96a759ec0689aa438fd9e"),
+    ("ubuntu2404", "x86_64"): (4328, "d2a6b11c096396d868758b86dab1823b25e14d70333f1dfa74da5ddaf6a06dba"),
+    ("ubuntu2404", "sbsa"): (4324, "6ea7d2737648936820e85677177957a0f6521b840d98eb0bbae0a4f003fa7249"),
+    ("debian12", "x86_64"): (4148, "e7f219eab6fe4819cdb5c15b98233dc3420302d9c00883219cd3d896857cf48d"),
+    ("debian12", "sbsa"): (4140, "bf2f53b1a19259501119f732bdef2699f8c80c69a18e6a78dad78d67d96766dc"),
+    ("debian13", "x86_64"): (4182, "d0d4ef986a44400f9db33c600ef33a985175e7cc63d805a10e1839c7a1e78f5f"),
+    ("debian13", "sbsa"): (4170, "022a3ec17a9f77a06882614c64b724384d5942644d30355404f74600766e8311"),
+}
+# Every source archive and tool setup downloads outside Hugging Face, pinned by size and SHA-256 (file_pin): a commit in a
+# GitHub archive URL names the source, but nothing checked that the bytes served for it were that source.  A pin here
+# changes with the commit it belongs to (the zip is hashed again when LLAMA_CPP_COMMIT moves).
+SOURCE_PINS = {
+    LLAMA_CPP_ZIP: (39564399, "cbe23c594282ead2937abb3f008e51fcec4609d9256652fff42c7cc1c21ea47b"),
+    **{CUDA_KEYRING_URL.format(repo=r, arch=a): pin for (r, a), pin in CUDA_KEYRING_PINS.items()},
+}
 
 # The ready-made engine: <PREBUILT_URL><asset>, a zip with strata(.exe), strata-vision(.exe) and BUILD.json, built
 # by tools/make_release.py.  Set this to the GitHub release download folder when publishing, e.g.
@@ -3443,10 +3465,40 @@ def pip_stamp_is_ours(stamp: Path) -> bool:
     return all(importlib.util.find_spec(m) is not None for m in ("numpy", "jinja2", "regex", "yaml"))
 
 
-def pip_install(packages, what, extra=()):
+LOCKS = ROOT / "packaging" / "locks"     # <kind>-<target>-cp3XX.txt, made by packaging/lock_wheels.py
+
+
+def lock_target() -> str | None:
+    """This PC as packaging/lock_wheels.py names its targets ("linux-x86_64", "windows-x86_64", ...), or None."""
+    m = platform.machine().lower()
+    if sys.platform == "darwin":
+        return "darwin-arm64" if m in ("arm64", "aarch64") else None
+    arch = {"amd64": "x86_64", "x86_64": "x86_64", "aarch64": "aarch64", "arm64": "aarch64"}.get(m)
+    osname = "windows" if WIN else "linux" if sys.platform.startswith("linux") else None
+    return f"{osname}-{arch}" if osname and arch else None
+
+
+def lock_file(kind: str) -> Path | None:
+    """The hash lock of `kind` ("runtime", "build", "nvfp4-local") for this platform and Python, None when there is none."""
+    target = lock_target()
+    if target is None:
+        return None
+    p = LOCKS / f"{kind}-{target}-cp{sys.version_info[0]}{sys.version_info[1]}.txt"
+    return p if p.is_file() else None
+
+
+def pip_install_runtime(what):
+    """The runtime packages (requirements.txt + requirements-monitor.txt), from their hash lock when this platform has one."""
+    pip_install(runtime_packages(), what, lock=lock_file("runtime"))
+
+
+def pip_install(packages, what, extra=(), lock: Path | None = None):
     """pip install into .venv, skipped when the same list was installed before.  An install from before the pinned
     requirements (#214) recorded bare names: those packages are kept as they are (nothing is reinstalled), and the
-    pinned dependencies it already has count as installed."""
+    pinned dependencies it already has count as installed.
+    lock: a hash lock (packaging/locks) covering `packages` and every dependency: it is installed instead, with
+    --require-hashes --no-deps --only-binary=:all:, so every wheel is the one the lock names, byte for byte.  Without one the
+    packages are pinned by version only, and setup says so."""
     if CONTROL:                                        # the app ships these (hash-locked); nothing is installed here
         missing = control_missing_packages()
         if missing:
@@ -3463,7 +3515,13 @@ def pip_install(packages, what, extra=()):
         return
     acquisition.require(what)
     say(f"  Installing {what} ...")
-    run([sys.executable, "-m", "pip", "install", "--quiet", "--disable-pip-version-check", *extra, *need])
+    pip = [sys.executable, "-m", "pip", "install", "--quiet", "--disable-pip-version-check", *extra]
+    if lock is not None:
+        run([*pip, "--require-hashes", "--no-deps", "--only-binary=:all:", "-r", str(lock)])
+    else:
+        warn(f"{what}: no hash lock for this platform and Python (packaging/locks), so the packages are checked by their "
+             "pinned versions only, not by their SHA-256")
+        run([*pip, *need])
     stamp.write_text(json.dumps(sorted(set(have) | set(need)), indent=0))
     stamp.with_name(stamp.name + ".os").write_text(sys.platform, encoding="utf-8")
     ok(f"{what} installed")
@@ -3497,8 +3555,17 @@ def ensure_nvfp4_local_packages() -> None:
     if not pkgs:
         fail("requirements-nvfp4-local.txt is missing", "update Strata, or run: python -m pip install torch transformers safetensors")
     say("  Converting NVIDIA's checkpoint needs PyTorch, transformers and safetensors (a few hundred MB, installed once).")
-    pip_install(pkgs, "PyTorch, transformers and safetensors (for the FP4-Local conversion)",
-                extra=[] if WIN else ["--extra-index-url", "https://download.pytorch.org/whl/cpu"])   # Linux: the CPU build, not 3 GB of CUDA libraries
+    lock = lock_file("nvfp4-local")
+    if lock is not None or WIN:
+        pip_install(pkgs, "PyTorch, transformers and safetensors (for the FP4-Local conversion)", lock=lock)
+    else:
+        # Linux: the CPU build of torch, not 3 GB of CUDA libraries.  PyTorch's index REPLACES PyPI for torch alone
+        # (--index-url, not --extra-index-url: with both, pip takes whichever index offers a version, and a name
+        # registered on PyPI could stand in for one of torch's dependencies); transformers and safetensors come from PyPI.
+        torch = [p for p in pkgs if req_name(p) == "torch"]
+        pip_install(torch, "PyTorch (CPU build, for the FP4-Local conversion)",
+                    extra=["--index-url", "https://download.pytorch.org/whl/cpu"])
+        pip_install([p for p in pkgs if p not in torch], "transformers and safetensors (for the FP4-Local conversion)")
     importlib.invalidate_caches()
 
 
@@ -3537,7 +3604,8 @@ ROCM_INDEXES = {"gfx1100": "https://rocm.nightlies.amd.com/v2/gfx110X-dgpu/",   
 # The TheRock nightly indexes are pruned and move on, and each GPU family's index holds its own range (#1103: gfx103X-all
 # starts at 7.13.0a20260422 and has no 7.10; #1267: the 7.10 wheel segfaults on a Strix Halo with kernel 7.2.8), so one
 # version for every card cannot work.  The wheel is chosen per index (the family): a preferred version, tried first; when
-# the index no longer offers it, the newest one of the same 7.x line, else of the same major, with a warning (rocm_pick).
+# the index no longer offers it, setup stops: the newest one of the same 7.x line (else of the same major, rocm_pick) is taken
+# only with STRATA_ROCM_ALLOW_NEWER=1, with a warning - an untested nightly compiler and runtime is not installed by itself.
 # STRATA_ROCM_VERSION still forces one exact version (no lookup).
 ROCM_VERSION_DEFAULT = "7.10.0a20251120"                 # what Strata's HIP build was tested with (gfx120X, gfx110X)
 ROCM_FAMILY_PINS = {"gfx103X-all": "7.13.0a20260515",    # #1103: 7.13.0a20260515 runs; the 7.14 nightlies time out
@@ -3650,6 +3718,12 @@ def rocm_wanted(index, listing=None):
             except (OSError, ValueError):
                 listing = ""
         version, note = rocm_pick(rocm_index_versions(listing), preferred)
+        if version != preferred and os.environ.get("STRATA_ROCM_ALLOW_NEWER") != "1":
+            # a nightly nobody here has run, installed into .venv and linked into the engine: never taken by itself
+            fail(f"ROCm {preferred}, the version this Strata pins for {rocm_family(index)}, is no longer on AMD's nightly index "
+                 f"(the newest of its line there is {version})",
+                 f"update Strata (a newer one pins a version the index has), or take {version} anyway with "
+                 f"STRATA_ROCM_ALLOW_NEWER=1 (or one exact version with STRATA_ROCM_VERSION=...)")
     if rocm_family(index) == "gfx1151" and (rocm_vkey(version) or (9, 0))[:2] < (7, 11):
         note = ((note + "; ") if note else "") + (
             "the ROCm 7.10 wheels segfault in the HSA runtime on a Strix Halo with a new kernel (7.2.8, #1267): "
@@ -4427,6 +4501,8 @@ def engine_from_feed(eng: Path, updating: bool = False) -> Path | None:
     per card in the signed update feed.  `strata update --no-control` fetches, verifies and test-starts the package for this PC
     (into a folder of its own under the install), and its files then become the installed engine in `eng`, the same way a
     zip's do.  None when it cannot be had (no internet, nothing for this card): the caller goes on as before."""
+    if prebuilt_refused("the ready-made engine from the update feed"):
+        return None
     acquisition.require("the ready-made engine")
     from strata_control import engine_component as ec
     store = home() / "engine-feed"
@@ -4476,6 +4552,8 @@ def engine_from_feed(eng: Path, updating: bool = False) -> Path | None:
 def get_prebuilt_hip(url_base, gpu, updating=False) -> Path | None:
     """The ready-made Windows HIP engine (WIN_HIP_ASSET) in engine/, kept between runs; None when it cannot be had
     (not published for this version, no internet) or has no code for the card."""
+    if prebuilt_refused("the ready-made AMD engine"):
+        return None
     acquisition.require("the ready-made AMD engine")
     eng = ROOT / "engine"
     info = eng / "BUILD.json"
@@ -4825,7 +4903,9 @@ def get_sd_cpp() -> Path:
     z1 = ROOT / "third_party" / f"stable-diffusion.cpp-{QI.SD_CPP_COMMIT[:7]}.zip"
     z2 = ROOT / "third_party" / f"sd-ggml-{QI.SD_GGML_COMMIT[:7]}.zip"
     download(QI.SD_CPP_ZIP, z1, "stable-diffusion.cpp source")
+    verify_sha256(z1, *QI.SD_CPP_ZIP_PIN)
     download(QI.SD_GGML_ZIP, z2, "stable-diffusion.cpp's ggml source")
+    verify_sha256(z2, *QI.SD_GGML_ZIP_PIN)
     try:
         src = QI.unpack_source(ROOT / "third_party", z1, z2)
     except zipfile.BadZipFile:
@@ -5091,8 +5171,10 @@ def verify_engine_archive(z: Path, asset: str, base: str) -> None:
     - a local folder (`--prebuilt D:/mirror`): nothing published to check against.  This warns and goes
       ahead - it is the user's own file, the same trust decision as `--gguf-dir`, and there is nothing an
       API could say about it;
-    - any other remote mirror: nothing published to check against either, but a network is in the middle,
-      so it warns and installs anyway (no digest is never a reason to refuse).
+    - anything fetched over the network without a digest (GitHub's API offline or rate limited, a remote
+      mirror): refused.  An executable that nothing vouches for is not installed; the update paths keep the
+      installed engine, a first install stops and says to try again later, use --build, or set
+      STRATA_SKIP_SHA256=1 to take it anyway.
 
     What a digest from the API does NOT cover, stated plainly: it proves the bytes are the ones GitHub
     published for that asset, so it catches a corrupted transfer, a mirror or proxy that substituted the
@@ -5114,10 +5196,14 @@ def verify_engine_archive(z: Path, asset: str, base: str) -> None:
         return
     want = engine_digest(asset, base)          # one API call: this is a rate-limited API
     if not want:
-        # no published digest (offline, rate limit, a mirror or folder): install anyway, never refuse
-        warn(f"could not get a SHA-256 for {asset} from GitHub (offline, rate limited, or not a release "
-             f"URL), so it was NOT verified. Installing it as it is.")
-        return
+        if is_local(base):                     # the user's own file on their own disk: their trust decision
+            warn(f"{asset} comes from the local folder {base}: there is no published SHA-256 to check it against, "
+                 f"so it was NOT verified. Installing it as it is.")
+            return
+        # downloaded, and nothing vouches for it (offline API, rate limit, a mirror with no release): refused
+        drop_download(z)
+        raise UnverifiedEngine(f"no SHA-256 for {asset} could be had from GitHub's releases API (offline, rate limited, "
+                               f"or {base} is not a GitHub release), so the download cannot be verified")
     size, sha = want
     have = z.stat().st_size if z.exists() else -1
     if have != size:
@@ -5146,9 +5232,10 @@ def engine_refused(asset: str, e: Exception, updating: bool) -> None:
     catches what the download can throw.
     """
     if not updating:
-        fail(f"the downloaded Strata engine does not match GitHub's checksum: {e}",
-             "the bad download has been deleted (corrupt or tampered), so the next run fetches the "
-             "published file again. Set STRATA_SKIP_SHA256=1 only if you insist on installing it anyway")
+        fail(f"the downloaded Strata engine could not be verified against GitHub's checksum: {e}",
+             "the download has been deleted (corrupt, tampered, or nothing to check it against), so the next run "
+             "fetches the published file again; a GitHub rate limit clears within the hour, and --build compiles the "
+             "engine here instead. Set STRATA_SKIP_SHA256=1 only if you insist on installing it anyway")
         return
     warn(f"keeping the engine that is installed: {e}")
     say("       Nothing was replaced. The bad download was deleted; run setup again to fetch it afresh.")
@@ -5156,11 +5243,47 @@ def engine_refused(asset: str, e: Exception, updating: bool) -> None:
 
 def prebuilt_bases(url_base) -> list[str]:
     """Where to look for the ready-made engine, in order (each ending in a slash).  The default: the release of this
-    checkout's version first, then the latest (#214); an explicit --prebuilt / STRATA_PREBUILT_URL: only that."""
+    checkout's version only (#214) - not the latest release, whose engine was built from other source than this checkout;
+    a version with no zips gets the signed feed's package, else a compile.  An explicit --prebuilt / STRATA_PREBUILT_URL:
+    only that."""
     base = url_base if url_base.endswith(("/", "\\")) else url_base + "/"
     if base != PREBUILT_URL:
         return [base]
-    return [PREBUILT_TAG_URL.format(version=source_version()), base]
+    return [PREBUILT_TAG_URL.format(version=source_version())]
+
+
+# --build is remembered per Strata folder: an install compiled from source stays compiled from source, also in a later
+# UPDATE, a model of another family (DeepSeek's engine package) or the CUDA 12 engine a Pascal card moves a model to.
+# STRATA_BUILD_ONLY=1 asks for the same for one process; --allow-prebuilt forgets it.
+BUILD_ONLY_MARK = ".strata-build-only"
+
+
+def build_only() -> bool:
+    """True when this Strata folder compiles every engine itself (an earlier --build, or STRATA_BUILD_ONLY=1)."""
+    if (os.environ.get("STRATA_BUILD_ONLY") or "").strip() == "1":
+        return True
+    return (home() / BUILD_ONLY_MARK).exists()
+
+
+def set_build_only(on: bool) -> None:
+    mark_file = home() / BUILD_ONLY_MARK
+    try:
+        if on:
+            if not mark_file.exists():
+                mark_file.write_text("--build: engines are compiled here, never downloaded (--allow-prebuilt undoes it)\n",
+                                     encoding="utf-8")
+        else:
+            mark_file.unlink(missing_ok=True)
+    except OSError as e:
+        warn(f"could not {'record' if on else 'forget'} --build in {mark_file} ({e})")
+
+
+def prebuilt_refused(what: str) -> bool:
+    """True (and says so) when `what`, a ready-made binary, must not be downloaded because this folder compiles from source."""
+    if not build_only():
+        return False
+    say(f"  {what}: not downloaded (--build: this Strata folder compiles its engines from source)")
+    return True
 
 
 PREVIOUS_ENGINE = ".previous"
@@ -5244,6 +5367,8 @@ def get_prebuilt(url_base, gpu, vision, updating=False, toolkit=13) -> Path | No
     """The ready-made engine in engine/ (kept between runs), or None when there is none for this PC.
     updating: called to replace an installed engine, which starts instead when this fails (no compile).
     toolkit 12: the experimental CUDA 12 engine (CUDA12_ASSET) in engine-cuda12/."""
+    if prebuilt_refused("the ready-made engine"):
+        return None
     acquisition.require("the ready-made engine")
     eng = engine_dir(toolkit)
     asset = CUDA12_ASSET if int(toolkit) == 12 else PREBUILT_ASSET
@@ -5488,6 +5613,8 @@ def update_installed_engine(url_base, toolkit=None) -> None:
 
 def pip_cuda_libs(toolkit=13) -> None:
     """NVIDIA's cuBLAS and CUDA runtime for a ready-made engine, from pip: CUDA 13's, or the CUDA 12 engine's."""
+    if prebuilt_refused("NVIDIA's CUDA libraries for a ready-made engine"):
+        return
     acquisition.require("NVIDIA's CUDA libraries (pip)")
     if int(toolkit) == 12:
         pip_install(CUDA12_WHEELS, "NVIDIA CUDA 12 libraries for the experimental engine (cuBLAS, CUDA runtime; ~0.7 GB)")
@@ -5599,11 +5726,22 @@ def install_build_tools(gpu, yes):
             if repo is None:
                 fail("the CUDA Toolkit can be installed automatically on Ubuntu 22.04 / 24.04 and Debian 12 / 13 only",
                      "install it from https://developer.nvidia.com/cuda-downloads and run it again")
-            deb = Path("/tmp/cuda-keyring.deb")
             # NVIDIA's arm64 server repository is "sbsa" (a DGX Spark; DGX OS normally has the toolkit already)
-            download(f"https://developer.download.nvidia.com/compute/cuda/repos/{repo}/"
-                     f"{'sbsa' if is_arm64() else 'x86_64'}/cuda-keyring_1.1-1_all.deb", deb, "CUDA repository key")
-            run(["sudo", "dpkg", "-i", str(deb)])
+            arch = "sbsa" if is_arm64() else "x86_64"
+            if (repo, arch) not in CUDA_KEYRING_PINS:
+                fail(f"there is no pinned CUDA repository key for {repo} ({arch})",
+                     "install the CUDA Toolkit from https://developer.nvidia.com/cuda-downloads and run it again")
+            # a folder only this user can write (not a fixed name in /tmp, where another user could leave a package and its
+            # finish mark for `sudo dpkg -i` to install as root); the key is checked against its pin before dpkg sees it
+            import tempfile
+            keydir = Path(tempfile.mkdtemp(prefix="strata-cuda-keyring-"))
+            deb = keydir / "cuda-keyring.deb"
+            try:
+                download(CUDA_KEYRING_URL.format(repo=repo, arch=arch), deb, "CUDA repository key")
+                verify_sha256(deb, *CUDA_KEYRING_PINS[(repo, arch)])
+                run(["sudo", "dpkg", "-i", str(deb)])
+            finally:
+                shutil.rmtree(keydir, ignore_errors=True)
             run(["sudo", "apt-get", "update"])
             if repo.startswith("ubuntu"):                  # as before: 13.0, and a failed install stops setup here
                 run(["sudo", "apt-get", "install", "-y", "cuda-toolkit-13-0"])
@@ -5644,7 +5782,7 @@ def ensure_build_tools():
     build_packages = requirement_lines(BUILD_REQUIREMENTS) if BUILD_REQUIREMENTS.exists() else BUILD_PACKAGES
     missing = [package for package in build_packages if not tool_usable(req_name(package))]
     if missing:
-        pip_install(missing, "CMake and Ninja build tools")
+        pip_install(missing, "CMake and Ninja build tools", lock=lock_file("build"))
     cmake, ninja = find_tool("cmake"), find_tool("ninja")
     if cmake is None or ninja is None:
         fail("cmake / ninja not found after installing them", "run: .venv python -m pip install -r requirements-build.txt")
@@ -6892,7 +7030,7 @@ def update_install(have: list, a) -> int:
         say("  No model is installed in this Strata folder yet: run START-HERE.bat (Linux: ./setup.sh) to set it up -")
         say("  it finds an earlier install's model files next to it and reuses them.")
         return 0
-    pip_install(runtime_packages(),
+    pip_install_runtime(
                 "numpy, jinja2, regex, pyyaml, tqdm, requests, pillow, psutil, textual (the screens)")
     if not a.build:
         update_installed_engine(a.prebuilt)
@@ -7461,7 +7599,7 @@ def use_cuda12(cards, cfg_path: Path, cfg: dict, yes: bool) -> dict:
     main = gpu_info(cards[0]["index"]) or cards[0]
     vision = "gpu" if cfg.get("vision") else "none"
     eng = get_cuda12_engine(os.environ.get("STRATA_PREBUILT_URL", PREBUILT_URL),
-                            {**main, "archs": sorted({int(g["arch"]) for g in cards})}, vision, yes)
+                            {**main, "archs": sorted({int(g["arch"]) for g in cards})}, vision, yes, build=build_only())
     cfg["exe"] = str(eng / EXE)
     cfg["cuda"] = 12
     cfg["lib_dirs"] = engine_lib_dirs(eng, 12)
@@ -7609,7 +7747,9 @@ def engine_step(a, gpu, hip, amd, cuda_tk, vision):
         if eng is None:
             fail("no ready-made AMD engine for this Strata version" + (" (--build)" if a.build else ""),
                  "compiling it on Windows: tools\\hip\\build_windows.bat makes strata-windows-x64-hip.zip, then run "
-                 "START-HERE.bat --backend hip --prebuilt <its dist folder> (docs/AMD_HIP.md)")
+                 "START-HERE.bat --backend hip --prebuilt <its dist folder>" +
+                 (" --allow-prebuilt (this folder remembers an earlier --build)" if build_only() else "") +
+                 " (docs/AMD_HIP.md)")
         gpu = hip_card(eng, gpu, amd)
         a.gpu = gpu["index"] if gpu["count"] > 1 else a.gpu
     else:
@@ -7840,7 +7980,7 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
         warn(f"little free disk space in {folder}: {free_gb(folder):.1f} GB free for about {left:.1f} GB. Setup goes on and should fit")
 
     step(3, "Python packages")
-    pip_install(runtime_packages(),
+    pip_install_runtime(
                 "numpy, jinja2, regex, pyyaml, tqdm, requests, cmake, ninja, pillow, psutil, textual (the screens)")
 
     step(4, "the Strata engine")
@@ -8014,6 +8154,8 @@ def get_dsv41_engine(eng: Path, hip: bool, package: str | None = None, feed: str
         exe = dsv41_engine.install_package(root, f, emit=lambda m: say("  " + m))
         if exe is not None:
             return exe
+    if prebuilt_refused("the ready-made DeepSeek engine package"):
+        return None
     acquisition.require("the DeepSeek engine")
     from strata_cli import update_cmd
     source = update_cmd._feed_source(argparse.Namespace(feed=feed), root.parent)
@@ -8032,6 +8174,8 @@ def upgrade_dsv41_engine(eng: Path, exe: Path, feed: str | None = None) -> Path:
     """The installed DeepSeek engine package is older than the signed feed's (--feed, else STRATA_UPDATE_FEED, a remembered https feed,
     or the release's): updated next to it, switched after its test start, the old one removed (strata_control.dsv41_engine.upgrade).
     Silent when the feed cannot be reached; a failure is one plain line and `exe` keeps running."""
+    if build_only():                                       # --build: nothing ready-made is fetched, not even an update
+        return exe
     from strata_control import dsv41_engine
     try:
         from strata_cli import update_cmd
@@ -8331,7 +8475,7 @@ def install_dsv41(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted, 
         warn(f"--rope-scaling / --kv / --resident-budget-gib / --low-ram are Flash-Next settings: {fam['title']} does not use them")
 
     step(3, "Python packages")
-    pip_install(runtime_packages(),
+    pip_install_runtime(
                 "numpy, jinja2, regex, pyyaml, tqdm, requests, cmake, ninja, pillow, psutil, textual (the screens)")
 
     # DeepSeek runs on its own engine package: the Strata (Qwen) engine, its llama.cpp source and its CUDA libraries are not needed for it, so none of
@@ -8858,7 +9002,11 @@ def main() -> int:
                          "starting the model (UPDATE.bat / update.sh run it after a git pull)")
     ap.add_argument("--rollback-engine", action="store_true",
                     help="put back the engine an update replaced (kept in engine/.previous), and keep the current one there")
-    ap.add_argument("--build", action="store_true", help="compile the engine instead of using the ready-made one")
+    ap.add_argument("--build", action="store_true",
+                    help="compile the engine instead of using the ready-made one; remembered for this Strata folder, so later "
+                         "runs (UPDATE, a new model, another toolkit) never fetch a ready-made engine either")
+    ap.add_argument("--allow-prebuilt", action="store_true",
+                    help="forget an earlier --build: ready-made engines may be downloaded again")
     ap.add_argument("--source", choices=SOURCES, default=None,
                     help="where the model files come from: auto (default: Hugging Face), huggingface or modelscope "
                          "(mainland China: the same files, checked against ModelScope's published SHA-256; "
@@ -8916,6 +9064,14 @@ def main() -> int:
                                                               if a.model in d["models"]))
     if a.source:
         os.environ["STRATA_SOURCE"] = a.source
+    if a.build and a.allow_prebuilt:
+        ap.error("--build and --allow-prebuilt contradict each other: pick one")
+    if a.allow_prebuilt:
+        set_build_only(False)
+    elif a.build:
+        set_build_only(True)
+    elif build_only():
+        a.build = True
     if a.inspect:                                      # headers only: nothing is installed
         sys.exit(subprocess.run([sys.executable, str(ROOT / "tools" / "strata_inspect.py"), *a.inspect[:2]]).returncode)
     if sys.platform == "darwin" and CONTROL:           # the app on a Mac: model files only; the Metal engine is a component
@@ -9632,7 +9788,7 @@ def main() -> int:
 
     # ---- 3. python packages
     step(3, "Python packages")
-    pip_install(runtime_packages(),
+    pip_install_runtime(
                 "numpy, jinja2, regex, pyyaml, tqdm, requests, pillow, psutil, textual (the screens)")
 
     # ---- 4. the engine

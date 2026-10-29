@@ -22,8 +22,9 @@ call :findpy
 if defined PY goto venv
 :pyorg
 echo  Downloading the Python installer from python.org ...
-powershell -NoProfile -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol='Tls12'; Invoke-WebRequest -UseBasicParsing https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe -OutFile \"$env:TEMP\strata-python-setup.exe\""
-if exist "%TEMP%\strata-python-setup.exe" "%TEMP%\strata-python-setup.exe" /quiet InstallAllUsers=0 PrependPath=1 Include_launcher=1 Include_test=0
+rem into a new folder of its own (never a fixed name in TEMP that something else could have left there), checked against
+rem its pinned SHA-256 before it runs, and removed afterwards
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; [Net.ServicePointManager]::SecurityProtocol='Tls12'; $d=Join-Path $env:TEMP ('strata-python-'+[guid]::NewGuid()); New-Item -ItemType Directory $d | Out-Null; $f=Join-Path $d 'python-setup.exe'; try { Invoke-WebRequest -UseBasicParsing https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe -OutFile $f; if ((Get-FileHash -Algorithm SHA256 $f).Hash -ne '67b5635e80ea51072b87941312d00ec8927c4db9ba18938f7ad2d27b328b95fb') { Write-Host '  The Python installer does not match its pinned SHA-256: it was not run.'; exit 1 }; Start-Process -Wait -FilePath $f -ArgumentList '/quiet','InstallAllUsers=0','PrependPath=1','Include_launcher=1','Include_test=0' } finally { Remove-Item -Recurse -Force $d -ErrorAction SilentlyContinue }"
 call :findpy
 if defined PY goto venv
 echo.

@@ -226,14 +226,23 @@ class ArchiveVerification(unittest.TestCase):
                 setup.verify_engine_archive(self.z, ASSET, TAG_BASE)
         self.assertFalse(self.z.exists())
 
-    def test_no_digest_warns_and_installs_anyway(self):
-        # "recommend, never force": no digest (offline, rate limit, mirror, folder) is a warning, not a refusal.
-        for base in (TAG_BASE, LOCAL_BASE, "https://mirror.invalid/dl/"):
-            said = io.StringIO()
-            with self.digest(None), mock.patch.object(setup, "warn", said.write):
-                setup.verify_engine_archive(self.z, ASSET, base)     # must not raise
-            self.assertIn("NOT verified", said.getvalue(), base)
-            self.assertTrue(self.z.exists())
+    def test_no_digest_from_a_local_folder_warns_and_installs(self):
+        # the user's own file on their own disk: their trust decision, as with --gguf-dir
+        said = io.StringIO()
+        with self.digest(None), mock.patch.object(setup, "warn", said.write):
+            setup.verify_engine_archive(self.z, ASSET, LOCAL_BASE)     # must not raise
+        self.assertIn("NOT verified", said.getvalue())
+        self.assertTrue(self.z.exists())
+
+    def test_no_digest_for_a_download_is_refused(self):
+        # offline API, a rate limit or a remote mirror: an executable nothing vouches for is not installed
+        for base in (TAG_BASE, "https://mirror.invalid/dl/"):
+            self.z.write_bytes(self.data)
+            with self.digest(None):
+                with self.assertRaises(setup.UnverifiedEngine) as caught:
+                    setup.verify_engine_archive(self.z, ASSET, base)
+            self.assertIn("cannot be verified", str(caught.exception), base)
+            self.assertFalse(self.z.exists(), base)
 
     def test_skip_env_skips_the_check_loudly(self):
         os.environ["STRATA_SKIP_SHA256"] = "1"

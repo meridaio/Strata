@@ -57,9 +57,18 @@ class RocmPick(unittest.TestCase):
         self.assertEqual((version, note), ("7.14.0a20260608", None))
         self.assertGreaterEqual(setup.rocm_vkey(version)[:2], (7, 11))
 
-    def test_pinned_version_gone_falls_back_to_the_same_line_with_a_warning(self):
+    def test_pinned_version_gone_stops_setup(self):
+        # an untested nightly is never installed by itself
+        with mock.patch.dict(setup.ROCM_FAMILY_PINS, {"gfx103X-all": "7.13.0a20260301"}), \
+                mock.patch.dict(setup.os.environ, {}, clear=False), mock.patch.object(setup, "say"):
+            setup.os.environ.pop("STRATA_ROCM_ALLOW_NEWER", None)
+            with self.assertRaises(SystemExit):
+                setup.rocm_wanted(setup.ROCM_INDEXES["gfx1030"], page("gfx103X-all"))
+
+    def test_pinned_version_gone_falls_back_to_the_same_line_when_allowed(self):
         old = setup.ROCM_FAMILY_PINS["gfx103X-all"]
-        with mock.patch.dict(setup.ROCM_FAMILY_PINS, {"gfx103X-all": "7.13.0a20260301"}):
+        with mock.patch.dict(setup.ROCM_FAMILY_PINS, {"gfx103X-all": "7.13.0a20260301"}), \
+                mock.patch.dict(setup.os.environ, {"STRATA_ROCM_ALLOW_NEWER": "1"}):
             version, note = setup.rocm_wanted(setup.ROCM_INDEXES["gfx1030"], page("gfx103X-all"))
         self.assertEqual(version, "7.13.0a20260515")             # the newest of 7.13, not of 7.14
         self.assertIn("7.13.0a20260301", note)
@@ -68,7 +77,8 @@ class RocmPick(unittest.TestCase):
 
     def test_whole_line_gone_falls_back_to_the_same_major(self):
         # gfx103X-all has no 7.10 line at all: the default 7.10.0a20251120 would land on the newest 7.x there
-        with mock.patch.dict(setup.ROCM_FAMILY_PINS, {"gfx103X-all": "7.10.0a20251120"}):
+        with mock.patch.dict(setup.ROCM_FAMILY_PINS, {"gfx103X-all": "7.10.0a20251120"}), \
+                mock.patch.dict(setup.os.environ, {"STRATA_ROCM_ALLOW_NEWER": "1"}):
             version, note = setup.rocm_wanted(setup.ROCM_INDEXES["gfx1030"], page("gfx103X-all"))
         self.assertEqual(version, "7.14.0a20260612")
         self.assertIn("same major", note)

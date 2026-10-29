@@ -273,7 +273,7 @@ class Engine(unittest.TestCase):
 
     def test_bases(self):
         self.assertEqual(setup.prebuilt_bases(setup.PREBUILT_URL),
-                         ["https://github.com/Niko1221/Strata/releases/download/v0.1.31/", setup.PREBUILT_URL])
+                         ["https://github.com/Niko1221/Strata/releases/download/v0.1.31/"])
         self.assertEqual(setup.prebuilt_bases("https://mirror.example/x"), ["https://mirror.example/x/"])
 
     def test_the_checkout_s_release_first(self):
@@ -283,11 +283,14 @@ class Engine(unittest.TestCase):
         self.assertEqual(got, [tag + setup.PREBUILT_ASSET])
         self.assertEqual(len(heads), 1)
 
-    def test_latest_when_it_is_not_published(self):
-        eng, out, heads, got = self.run_get([setup.PREBUILT_URL])
-        self.assertEqual(eng, self.root / "engine")
-        self.assertEqual(got, [setup.PREBUILT_URL + setup.PREBUILT_ASSET])
-        self.assertIn("No ready-made engine for v0.1.31", out)
+    def test_not_the_latest_when_it_is_not_published(self):
+        # the latest release's engine is built from other source than this checkout: never taken in its place
+        with mock.patch.object(setup, "engine_from_feed", return_value=None) as feed:
+            eng, out, heads, got = self.run_get([setup.PREBUILT_URL])
+        self.assertIsNone(eng)
+        self.assertEqual(got, [])
+        self.assertEqual(len(heads), 1)
+        feed.assert_called_once()
 
     def test_a_refused_archive_is_not_kept(self):
         """PR #324: a refused archive (too old, or no code for the GPU) kept its zip and .done mark, and every later
@@ -370,7 +373,7 @@ class Requirements(unittest.TestCase):
                 return "/usr/bin/cmake"
             return "/venv/bin/ninja" if installed else None
 
-        def pip_install(packages, what):
+        def pip_install(packages, what, **kwargs):
             nonlocal installed
             requests.append((packages, what))
             installed = True

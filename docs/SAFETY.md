@@ -138,8 +138,20 @@ size stops it before the download starts.
   (`setup.py`: `REPO_PINS`, `download`, `verify_sha256`; `tools/mtp_fetch.py`; `apps/host/server/image-models.mjs`.)
 
 **Engine in the source route.** `setup.py` checks the engine zip against the SHA-256 that GitHub's API publishes for that
-release file. If GitHub cannot say (offline, rate limit), setup warns and installs anyway. `STRATA_SKIP_SHA256=1` switches the
-check off, and it is never on by default.
+release file. If GitHub cannot say (offline, rate limit), the zip is not installed: an update keeps the engine you have, a
+first install stops and says so. Only a zip from a folder on your own disk (`--prebuilt D:\folder`) is installed without a
+published hash, with a warning. `STRATA_SKIP_SHA256=1` switches the check off, and it is never on by default. Setup takes the
+engine of this checkout's own release only, never the latest release's in its place.
+
+**Compiling everything here (`--build`).** `--build` compiles the engine on your PC and is remembered for the Strata folder
+(`.strata-build-only`): later runs, UPDATE, a model of another family and the CUDA 12 engine never download a ready-made engine,
+engine package or NVIDIA's CUDA libraries for one. `--allow-prebuilt` forgets it. What is still downloaded for a compile is
+pinned: llama.cpp's and stable-diffusion.cpp's source zips and NVIDIA's CUDA repository key by SHA-256 in `setup.py`
+(`SOURCE_PINS`, `CUDA_KEYRING_PINS`, `tools/image/qimage.py`), the Vulkan SDK and metal-cpp likewise. The Python packages come
+from the hash locks in `packaging/locks` when one matches your platform and Python (3.12), else by their pinned versions with a
+warning. AMD's ROCm wheels are AMD's nightly builds pinned by version: when the pinned one is gone from AMD's index, setup stops
+instead of taking a newer one (`STRATA_ROCM_ALLOW_NEWER=1` takes it). The compiler, CUDA toolkit and build tools come from your
+distribution, winget or NVIDIA's apt repository.
 
 **The one-line install** (`curl ... | sh`, `irm ... | iex`) checks the Terminal archive's SHA-256 and the signed feed with the
 Terminal it just unpacked. The checksum and the key come from the same release as the archive, so the first install trusts

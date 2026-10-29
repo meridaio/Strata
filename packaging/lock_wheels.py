@@ -10,8 +10,11 @@ packages) by letting pip resolve and download the wheels for the target's tags a
     python packaging/lock_wheels.py --target windows-x86_64          # writes packaging/locks/...
     python packaging/lock_wheels.py --target linux-x86_64 --check    # fails when the committed lock differs
     python packaging/lock_wheels.py --target linux-x86_64 --download wheelhouse/   # exactly the locked wheels
+    python packaging/lock_wheels.py --target linux-x86_64 --kind build    # build-<target>-cp312.txt (cmake, ninja)
 
-Run it when a pin in requirements.txt changes, review the diff, commit. Building an archive never runs it.
+setup.py installs from the same locks on a source install whose platform and Python have one (`lock_file` there), so
+an install compiled from source gets exactly these wheels too. Run it when a pin in requirements.txt (or
+requirements-build.txt) changes, review the diff, commit. Building an archive never runs it.
 """
 
 from __future__ import annotations
@@ -27,6 +30,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 LOCKS = ROOT / "packaging" / "locks"
 INPUTS = ("requirements.txt", "requirements-monitor.txt")
+#: the requirement files each kind of lock is made from: runtime (the terminal archive, and setup.py's runtime packages)
+#: and build (the cmake and ninja wheels setup.py installs for a compile)
+KINDS = {"runtime": INPUTS, "build": ("requirements-build.txt",)}
 
 #: pip's tags for each target, and the environment markers evaluate under for it.
 TARGETS = {
@@ -46,8 +52,8 @@ PYTHON = "3.12"
 ABI = "cp312"
 
 
-def lock_path(target: str) -> Path:
-    return LOCKS / f"runtime-{target}-{ABI}.txt"
+def lock_path(target: str, kind: str = "runtime") -> Path:
+    return LOCKS / f"{kind}-{target}-{ABI}.txt"
 
 
 def sha256(path: Path) -> str:
@@ -62,14 +68,14 @@ def norm(name: str) -> str:
     return re.sub(r"[-_.]+", "-", name).lower()
 
 
-def _dropped_for_target(target: str) -> set[str]:
+def _dropped_for_target(target: str, inputs=INPUTS) -> set[str]:
     """Direct requirements whose environment marker is false for the target (pip evaluated markers for the host that
     runs this script: a Windows-only package must not land in the Linux lock, nor the reverse)."""
     from packaging.requirements import Requirement
     env = {"python_version": PYTHON, "python_full_version": PYTHON + ".15", "implementation_name": "cpython",
            "platform_python_implementation": "CPython", **TARGETS[target]["env"]}
     dropped = set()
-    for name in INPUTS:
+    for name in inputs:
         for line in (ROOT / name).read_text(encoding="utf-8").splitlines():
             line = line.split(" #")[0].strip()
             if not line or line.startswith("#"):
@@ -79,7 +85,7 @@ def _dropped_for_target(target: str) -> set[str]:
                 dropped.add(norm(req.name))
     # a requirement listed twice with different markers (numpy) is kept when any line applies
     kept = set()
-    for name in INPUTS:
+    for name in inputs:
         for line in (ROOT / name).read_text(encoding="utf-8").splitlines():
             line = line.split(" #")[0].strip()
             if not line or line.startswith("#"):
@@ -90,27 +96,37 @@ def _dropped_for_target(target: str) -> set[str]:
     return dropped - kept
 
 
-def build_lock(target: str) -> str:
+def build_lock(target: str, kind: str = "runtime") -> str:
     spec = TARGETS[target]
+    inputs = KINDS[kind]
     with tempfile.TemporaryDirectory(prefix="strata-lock-") as tmp:
         cmd = [sys.executable, "-m", "pip", "download", "--quiet", "--only-binary=:all:",
                "--python-version", PYTHON, "--implementation", "cp", "--abi", ABI, "-d", tmp]
         for p in spec["platforms"]:
             cmd += ["--platform", p]
-        for name in INPUTS:
+        for name in inputs:
             cmd += ["-r", str(ROOT / name)]
         subprocess.run(cmd, check=True)
         wheels: dict[str, tuple[str, list[str]]] = {}
         for whl in sorted(Path(tmp).glob("*.whl")):
             name, version = whl.name.split("-")[:2]
             wheels.setdefault(norm(name), (version, []))[1].append(sha256(whl))
-    drop = _dropped_for_target(target)
-    out = [
-        "# Hash-pinned runtime packages for the " + target + " terminal archive (CPython 3.12, " + ABI + ").",
-        "# Made by packaging/lock_wheels.py from requirements.txt + requirements-monitor.txt; installed at BUILD time with",
-        "#   pip install --require-hashes --no-deps --only-binary=:all: -r <this file>",
-        "# and never on the user's PC. To change a package: edit requirements.txt, run lock_wheels.py, review the diff.",
-    ]
+    drop = _dropped_for_target(target, inputs)
+    if kind == "runtime":
+        out = [
+            "# Hash-pinned runtime packages for the " + target + " terminal archive (CPython 3.12, " + ABI + ").",
+            "# Made by packaging/lock_wheels.py from requirements.txt + requirements-monitor.txt; installed at BUILD time with",
+            "#   pip install --require-hashes --no-deps --only-binary=:all: -r <this file>",
+            "# and by setup.py on a source install of this platform and Python. To change a package: edit requirements.txt,",
+            "# run lock_wheels.py, review the diff.",
+        ]
+    else:
+        out = [
+            "# Hash-pinned " + kind + " packages for " + target + " (CPython 3.12, " + ABI + ").",
+            "# Made by packaging/lock_wheels.py --kind " + kind + " from " + " + ".join(inputs) + "; setup.py installs it with",
+            "#   pip install --require-hashes --no-deps --only-binary=:all: -r <this file>",
+            "# To change a package: edit " + inputs[0] + ", run lock_wheels.py --kind " + kind + ", review the diff.",
+        ]
     for name in sorted(wheels):
         if name in drop:
             continue
@@ -141,11 +157,13 @@ def main() -> int:
     ap.add_argument("--target", choices=sorted(TARGETS), required=True)
     ap.add_argument("--check", action="store_true", help="compare with the committed lock instead of writing")
     ap.add_argument("--download", metavar="DIR", help="fetch the locked wheels into DIR (hash-checked) and stop")
+    ap.add_argument("--kind", choices=sorted(KINDS), default="runtime",
+                    help="runtime (default: the archive's and setup's runtime packages) or build (cmake, ninja)")
     a = ap.parse_args()
     if a.download:
         return download_locked(a.target, Path(a.download))
-    text = build_lock(a.target)
-    path = lock_path(a.target)
+    text = build_lock(a.target, a.kind)
+    path = lock_path(a.target, a.kind)
     if a.check:
         same = path.exists() and path.read_text(encoding="utf-8") == text
         print(("lock is current: " if same else "lock DIFFERS: ") + str(path))

@@ -25,6 +25,9 @@ SD_CPP_COMMIT = "2988060a4338a5dcd94721c964a8e87003c1ac8b"     # "add TAEQI2.1 s
 SD_GGML_COMMIT = "d25b121ce1d6ae0c7e62ad080460d9fc1e46dd93"    # its ggml submodule (leejet/ggml)
 SD_CPP_ZIP = f"https://github.com/leejet/stable-diffusion.cpp/archive/{SD_CPP_COMMIT}.zip"
 SD_GGML_ZIP = f"https://github.com/leejet/ggml/archive/{SD_GGML_COMMIT}.zip"
+# (bytes, sha256) of the two archives at those commits: hashed again when a commit moves
+SD_CPP_ZIP_PIN = (124705796, "0d923e749129ff3f1d690af90ee25b6306dc70cacb245997fc8c652bc129abc9")
+SD_GGML_ZIP_PIN = (5374391, "3945134a4d6aea8faa5c2dff0f9eb9ee328de1a43e48a158b7e92ab229d3a697")
 
 # the LunarG Vulkan SDK for a Linux PC without Vulkan development files (headers, glslc): unpacked into third_party,
 # no sudo; the version the 780M builds were made with
