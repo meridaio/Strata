@@ -43,11 +43,15 @@ class AptRepo(unittest.TestCase):
                 mock.patch.object(setup.shutil, "which", lambda n: "/usr/bin/" + n), \
                 mock.patch("builtins.open", mock.mock_open(read_data='ID=debian\nVERSION_ID="13"\n')), \
                 mock.patch.object(setup, "download") as download, \
+                mock.patch.object(setup, "verify_sha256") as verify, \
                 mock.patch.object(setup, "run", side_effect=fake_run), \
                 contextlib.redirect_stdout(io.StringIO()):
             nvcc, _ = setup.install_build_tools({"arch": "86", "archs": [86]}, True)
         self.assertEqual(nvcc, "/usr/local/cuda-13.1/bin/nvcc")
         self.assertIn("repos/debian13/x86_64/cuda-keyring_1.1-1_all.deb", download.call_args[0][0])
+        deb = download.call_args[0][1]                       # a private folder, never a fixed name in /tmp
+        self.assertNotEqual(str(deb), "/tmp/cuda-keyring.deb")
+        self.assertEqual(verify.call_args[0][1:], setup.CUDA_KEYRING_PINS[("debian13", "x86_64")])
         self.assertEqual(installed[-2:], ["cuda-toolkit-13-0", "cuda-toolkit-13-1"])
 
     def test_ubuntu_still_installs_exactly_13_0(self):
@@ -62,7 +66,7 @@ class AptRepo(unittest.TestCase):
                 mock.patch.object(setup, "find_nvcc", side_effect=[(None, (0, 0)), ("/usr/local/cuda-13.0/bin/nvcc", (13, 0))]), \
                 mock.patch.object(setup.shutil, "which", lambda n: "/usr/bin/" + n), \
                 mock.patch("builtins.open", mock.mock_open(read_data='ID=ubuntu\nVERSION_ID="24.04"\n')), \
-                mock.patch.object(setup, "download"), \
+                mock.patch.object(setup, "download"), mock.patch.object(setup, "verify_sha256"), \
                 mock.patch.object(setup, "run", side_effect=fake_run), \
                 contextlib.redirect_stdout(io.StringIO()):
             setup.install_build_tools({"arch": "86", "archs": [86]}, True)
@@ -74,7 +78,7 @@ class AptRepo(unittest.TestCase):
                 mock.patch.object(setup, "find_nvcc", return_value=(None, (0, 0))), \
                 mock.patch.object(setup.shutil, "which", lambda n: "/usr/bin/" + n), \
                 mock.patch("builtins.open", mock.mock_open(read_data='ID=debian\nVERSION_ID="12"\n')), \
-                mock.patch.object(setup, "download"), \
+                mock.patch.object(setup, "download"), mock.patch.object(setup, "verify_sha256"), \
                 mock.patch.object(setup, "run", return_value=types.SimpleNamespace(returncode=100)), \
                 contextlib.redirect_stdout(out):
             with self.assertRaises(SystemExit):
@@ -92,7 +96,7 @@ class AptRepo(unittest.TestCase):
                 mock.patch.object(setup, "find_nvcc", return_value=(None, (0, 0))), \
                 mock.patch.object(setup.shutil, "which", lambda n: "/usr/bin/" + n), \
                 mock.patch("builtins.open", mock.mock_open(read_data='ID=ubuntu\nVERSION_ID="22.04"\n')), \
-                mock.patch.object(setup, "download"), \
+                mock.patch.object(setup, "download"), mock.patch.object(setup, "verify_sha256"), \
                 mock.patch.object(setup, "run", side_effect=fake_run), \
                 contextlib.redirect_stdout(io.StringIO()):
             with self.assertRaises(SystemExit):

@@ -88,11 +88,18 @@ class Fp4LocalPackages(unittest.TestCase):
         calls = []
         with mock.patch("importlib.util.find_spec", lambda name: None), mock.patch.object(setup, "CONTROL", False), \
                 mock.patch.object(setup, "say", lambda *a, **k: None), \
-                mock.patch.object(setup, "pip_install", lambda pkgs, what, extra=(): calls.append((list(pkgs), list(extra)))):
+                mock.patch.object(setup, "lock_file", return_value=None), \
+                mock.patch.object(setup, "pip_install",
+                                  lambda pkgs, what, extra=(), lock=None: calls.append((list(pkgs), list(extra)))):
             setup.ensure_nvfp4_local_packages()
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0][0], setup.nvfp4_local_packages())
-        self.assertEqual(bool(calls[0][1]), not setup.WIN)               # the CPU wheel index only on Linux
+        self.assertEqual(sorted(p for c in calls for p in c[0]), sorted(setup.nvfp4_local_packages()))
+        if setup.WIN:
+            self.assertEqual(calls, [(setup.nvfp4_local_packages(), [])])
+        else:                                       # Linux: torch alone from the CPU wheel index (it replaces PyPI), the rest from PyPI
+            self.assertEqual(len(calls), 2)
+            self.assertTrue(all(setup.req_name(p) == "torch" for p in calls[0][0]), calls[0][0])
+            self.assertEqual(calls[0][1], ["--index-url", "https://download.pytorch.org/whl/cpu"])
+            self.assertEqual(calls[1][1], [])
 
     def test_nothing_is_installed_when_they_are_there(self):
         with mock.patch("importlib.util.find_spec", lambda name: object()), \
